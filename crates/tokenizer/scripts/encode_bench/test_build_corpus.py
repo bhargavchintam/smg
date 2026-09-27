@@ -178,5 +178,25 @@ class BuildCorpusTest(unittest.TestCase):
         )
 
 
+class RepoSourcesTest(unittest.TestCase):
+    def test_only_git_tracked_files_are_used(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "crates" / "a" / "src").mkdir(parents=True)
+            (repo / "model_gateway" / "src").mkdir(parents=True)
+            (repo / "crates" / "a" / "src" / "lib.rs").write_text("pub fn a() {}\n")
+            (repo / "model_gateway" / "src" / "main.rs").write_text("fn main() {}\n")
+            (repo / "README.md").write_text("# readme\n")
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            (repo / "notes.md").write_text("untracked local notes\n")
+            (repo / "crates" / "a" / "src" / "scratch.rs").write_text("// untracked\n")
+            code, prose = bc._repo_sources(repo)
+        self.assertEqual([p.relative_to(repo).as_posix() for p in code], ["crates/a/src/lib.rs", "model_gateway/src/main.rs"])
+        self.assertEqual([p.relative_to(repo).as_posix() for p in prose], ["README.md"])
+
+
 if __name__ == "__main__":
     unittest.main()

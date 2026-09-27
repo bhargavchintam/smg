@@ -1,0 +1,73 @@
+# Encode-backend benchmark on GitHub-hosted Linux runners (x86_64 and arm64).
+# Manual only, and never in the upstream repository: it exists so the numbers in
+# crates/tokenizer/scripts/encode_bench can be reproduced off a laptop.
+name: Encode benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      legs:
+        description: Timing legs per build (even number)
+        default: "6"
+      builds:
+        description: Builds to compare (z = SMG release profile as shipped)
+        default: "z,hotdeps,o2"
+      conversations_sha256:
+        description: Expected sha256 of conversations.jsonl (same corpus as the laptop run)
+        default: "b5050a08bf6775c3c2666658ac0ee7dad765d9f1a4c1088325042f0054e5b887"
+      stress_sha256:
+        description: Expected sha256 of stress.jsonl
+        default: "e98a7fe74c51af61e69f4da2b6cf4726c89c679836d09579cdcead026f10c25b"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    if: github.repository != 'smg-project/smg'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      DATA: ${{ github.workspace }}/../encode-bench-data
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Make sure GNU time is available (peak RSS)
+        run: test -x /usr/bin/time || (sudo apt-get update && sudo apt-get install -y time)
+
+      - name: Fetch tokenizers and rebuild the corpus
+        working-directory: crates/tokenizer/scripts/encode_bench
+        run: |
+          set -euo pipefail
+          python3 fetch_models.py --out "$DATA/models"
+          mkdir -p "$DATA/sources"
+          curl -sSfL -o "$DATA/sources/gutenberg-23962-xiyouji.txt" \
+            https://www.gutenberg.org/ebooks/23962.txt.utf-8
+          echo "af3c9e408c0c58595b666ed9981b6fa1e9343f4bbc78309b1cb0818c32fc1f58  $DATA/sources/gutenberg-23962-xiyouji.txt" \
+            | sha256sum -c -
+          python3 build_corpus.py --repo "$GITHUB_WORKSPACE" \
+            --cjk "$DATA/sources/gutenberg-23962-xiyouji.txt" --out "$DATA/corpus"
+          printf '%s  %s\n%s  %s\n' \
+            "${{ inputs.conversations_sha256 }}" "$DATA/corpus/conversations.jsonl" \
+            "${{ inputs.stress_sha256 }}" "$DATA/corpus/stress.jsonl" | sha256sum -c -
+
+      - name: Run the benchmark
+        run: |
+          python3 crates/tokenizer/scripts/encode_bench/run_bench.py --data "$DATA" \
+            --legs "${{ inputs.legs }}" --builds "${{ inputs.builds }}" \
+            --throughput-threads "1,$(nproc)" --run-id "${{ matrix.runner }}-${{ github.run_id }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: encode-bench-${{ matrix.runner }}
+          path: ${{ env.DATA }}/results/

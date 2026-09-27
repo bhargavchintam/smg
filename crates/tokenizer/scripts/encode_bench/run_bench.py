@@ -3,7 +3,7 @@
 Steps:
   1. build the example once per build profile (z = SMG's shipped release
      profile, hotdeps = HF encode crates at opt-level 2, o2 = everything at 2)
-  2. render the corpus with SMG's chat templates (once per model)
+  2. render the corpus with SMG's chat templates (fresh for every run)
   3. parity with every build, plus fastokens pinned to 1 BPE thread
   4. time every encode in palindromic build order (z hotdeps o2 o2 hotdeps z ...)
   5. throughput, load time and peak RSS
@@ -160,11 +160,11 @@ def _resolve_models(data, specs):
 
 def bench_model(name, model, data, out, builds, legs, tp_threads, tp_seconds):
     corpus = Path(data) / "corpus"
-    prompts = Path(data) / "prompts" / f"{name}.jsonl"
     z = _binary("z")
-    if not prompts.exists():
-        prompts.parent.mkdir(parents=True, exist_ok=True)
-        _run([z, "render", "--model", model, "--conversations", corpus / "conversations.jsonl", "--out", prompts])
+    # Render fresh for every run: prompts always match this corpus and this commit.
+    out.mkdir(parents=True, exist_ok=True)
+    prompts = out / "prompts.jsonl"
+    _run([z, "render", "--model", model, "--conversations", corpus / "conversations.jsonl", "--out", prompts])
     parity = out / "parity"
     parity.mkdir(parents=True, exist_ok=True)
     common = ["--model", model, "--prompts", prompts, "--stress", corpus / "stress.jsonl", "--conversations", corpus / "conversations.jsonl"]

@@ -21,6 +21,7 @@ import hashlib
 import json
 import random
 import re
+import subprocess
 from pathlib import Path
 
 KINDS = ["code", "prose", "cjk", "json", "mixed"]
@@ -377,12 +378,14 @@ def build_corpus(out_dir, code_files, prose_files, cjk_files, seed=1234, per_buc
 
 
 def _repo_sources(repo):
+    """Git-tracked Rust sources and Markdown docs only, so any clean checkout of
+    the same commit rebuilds exactly the same corpus (local notes never leak in)."""
     repo = Path(repo)
-    skip = ("/target/", "/.git/", "/node_modules/", "/scripts/encode_bench/")
-    code = [p for p in repo.glob("crates/*/src/**/*.rs") if not any(s in str(p) for s in skip)]
-    code += [p for p in repo.glob("model_gateway/src/**/*.rs") if not any(s in str(p) for s in skip)]
-    prose = [p for p in repo.glob("**/*.md") if not any(s in str(p) for s in skip)]
-    return sorted(code), sorted(prose)
+    listing = subprocess.run(["git", "-C", str(repo), "ls-files", "-z"], check=True, capture_output=True).stdout
+    files = [f for f in listing.decode("utf-8").split("\0") if f and "scripts/encode_bench/" not in f]
+    code = [f for f in files if f.endswith(".rs") and re.match(r"(crates/[^/]+/src|model_gateway/src)/", f)]
+    prose = [f for f in files if f.endswith(".md")]
+    return sorted(repo / f for f in code), sorted(repo / f for f in prose)
 
 
 def main():
