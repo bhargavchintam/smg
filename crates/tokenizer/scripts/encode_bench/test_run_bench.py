@@ -1,7 +1,9 @@
 """Tests for run_bench.py. Run: python3 -m unittest -v test_run_bench"""
 
+import tempfile
 import unittest
 from collections import Counter
+from pathlib import Path
 
 import run_bench as rb
 
@@ -64,6 +66,29 @@ class MaxRssTest(unittest.TestCase):
 
     def test_returns_none_when_absent(self):
         self.assertIsNone(rb.parse_max_rss_mb("no memory line here"))
+
+
+class PowerTest(unittest.TestCase):
+    def test_reads_ac_and_battery_from_pmset(self):
+        self.assertEqual(rb.power_source("Now drawing from 'AC Power'\n -InternalBattery-0 99%"), "AC")
+        self.assertEqual(rb.power_source("Now drawing from 'Battery Power'\n"), "battery")
+        self.assertIsNone(rb.power_source(""))
+
+
+class ResolveModelsTest(unittest.TestCase):
+    def test_picks_the_pinned_revision_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "models"
+            (root / "Qwen__Qwen3-4B-Instruct-2507@000000000000").mkdir(parents=True)
+            pinned = root / "Qwen__Qwen3-4B-Instruct-2507@cdbee75f17c0"
+            pinned.mkdir()
+            self.assertEqual(rb.resolve_models(tmp, ["qwen3"]), {"qwen3": pinned})
+
+    def test_missing_pinned_directory_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "models").mkdir()
+            with self.assertRaises(SystemExit):
+                rb.resolve_models(tmp, ["qwen3"])
 
 
 if __name__ == "__main__":

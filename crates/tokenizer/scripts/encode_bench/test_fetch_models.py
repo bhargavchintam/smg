@@ -1,6 +1,9 @@
 """Tests for fetch_models.py. Run: python3 -m unittest -v test_fetch_models"""
 
+import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 import fetch_models as fm
 
@@ -44,6 +47,33 @@ class FetchModelsTest(unittest.TestCase):
         self.assertEqual(
             fm.file_url("Qwen/Qwen3-4B-Instruct-2507", "abc123", "tokenizer.json"),
             "https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507/resolve/abc123/tokenizer.json",
+        )
+
+
+class PinsTest(unittest.TestCase):
+    def test_pins_cover_the_benchmark_models_with_full_revisions(self):
+        for model in ("Qwen/Qwen3-4B-Instruct-2507", "deepseek-ai/DeepSeek-V3.2"):
+            pin = fm.PINS[model]
+            self.assertEqual(len(pin["revision"]), 40)
+            self.assertIn("tokenizer.json", pin["files"])
+
+    def test_verify_files_accepts_matching_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a.json").write_text("x")
+            fm.verify_files(Path(tmp), {"a.json": hashlib.sha256(b"x").hexdigest()})
+
+    def test_verify_files_names_changed_and_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "a.json").write_text("changed")
+            with self.assertRaises(ValueError) as ctx:
+                fm.verify_files(Path(tmp), {"a.json": hashlib.sha256(b"x").hexdigest(), "b.json": "0" * 64})
+        self.assertIn("a.json", str(ctx.exception))
+        self.assertIn("b.json", str(ctx.exception))
+
+    def test_pinned_dir_uses_the_pinned_revision(self):
+        self.assertEqual(
+            fm.pinned_dir(Path("/m"), "Qwen/Qwen3-4B-Instruct-2507"),
+            Path("/m") / "Qwen__Qwen3-4B-Instruct-2507@cdbee75f17c0",
         )
 
 

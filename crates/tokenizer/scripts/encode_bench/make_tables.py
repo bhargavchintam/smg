@@ -1,15 +1,16 @@
 """Turn encode-benchmark outputs into results.md.
 
 Reads one run directory written by run_bench.py:
-  env.json                      machine, toolchain, commits, corpus and model revisions
-  <model>/timing-*.csv          per-encode wall/CPU time (encode_backends time)
-  <model>/throughput-*.csv      tokens/s with N workers (encode_backends throughput)
-  <model>/load-*.csv            backend construction time (encode_backends load)
-  <model>/rss.csv               peak RSS per backend (/usr/bin/time)
-  <model>/parity/*.json         parity reports (encode_backends parity)
+  env.json                         machine, toolchain, commits, corpus and model pins
+  <model>/timing-*.csv             fresh prompts (after a disjoint warm-up): the headline
+  <model>/repeat-*.csv             exact repeats (warm-up on the timed prompts)
+  <model>/turns-*.csv              multi-turn chats, SMG caches on and off
+  <model>/throughput-*.csv         one pass, N workers, shared queue
+  <model>/load-*.csv, rss.csv, rss_runtime.csv   construction time and peak memory
+  <model>/parity/*.json            token-id parity reports
 
 Example:
-  python3 make_tables.py ~/Downloads/oss/encode-bench-data/results/<run-id>
+  python3 make_tables.py "$DATA/results/<run-id>"
 """
 
 import argparse
@@ -22,7 +23,8 @@ from pathlib import Path
 DASH = "—"
 BUCKETS = ["100", "2k", "16k", "50k"]
 CONTROLS = ("smg_again", "control_drop_last")
-# (label, build, fastokens threads, variant); the first column is the baseline.
+# (label, build, fastokens threads, variant[, baseline (build, threads, variant)]).
+# Without a baseline, a column is compared with the first column.
 LATENCY_COLUMNS = [
     ("SMG as shipped", "z", "default", "smg"),
     ("SMG, tokenizers at O2", "tok", "default", "smg"),
@@ -31,7 +33,18 @@ LATENCY_COLUMNS = [
     ("SMG, all O2", "o2", "default", "smg"),
     ("HF encode_fast", "z", "default", "hf_encode_fast"),
     ("fastokens", "z", "default", "fastokens"),
-    ("fastokens, 1 thread", "z", "1", "fastokens"),
+    ("fastokens, 1 thread", "z", "1", "fastokens", ("z", "1", "smg")),
+]
+REPEAT_COLUMNS = [
+    ("SMG as shipped", "z", "default", "smg"),
+    ("HF encode_fast", "z", "default", "hf_encode_fast"),
+    ("fastokens", "z", "default", "fastokens"),
+]
+TURN_COLUMNS = [
+    ("SMG as shipped", "z", "default", "smg"),
+    ("SMG + L0/L1 caches", "z", "default", "smg_cached"),
+    ("fastokens", "z", "default", "fastokens"),
+    ("fastokens + L0/L1 caches", "z", "default", "fastokens_cached"),
 ]
 
 
@@ -54,7 +67,7 @@ def p90(xs):
 def summarize_timing(rows):
     """Per (build, threads, variant, bucket): statistics over per-input medians.
 
-    Each prompt is timed once per round; its median over rounds is its time.
+    Each prompt is timed once per leg; its median over legs is its time.
     The bucket's median/p90 are taken over those per-prompt medians.
     """
     per_input = defaultdict(lambda: {"wall": [], "cpu": [], "tokens": 0})
@@ -84,6 +97,30 @@ def summarize_timing(rows):
     return summary
 
 
+def leg_spread(rows):
+    """(max - min) / median of the per-leg bucket medians: how much legs disagree."""
+    per_leg = defaultdict(list)
+    for r in rows:
+        per_leg[(r["build"], r["fastokens_threads"], r["variant"], r["bucket"], r["round"])].append(int(r["wall_ns"]) / 1e6)
+    legs = defaultdict(list)
+    for (build, threads, variant, bucket, _leg), walls in per_leg.items():
+        legs[(build, threads, variant, bucket)].append(median(walls))
+    return {key: (max(ms) - min(ms)) / median(ms) for key, ms in legs.items()}
+
+
+def summarize_throughput(rows):
+    """Per (build, threads, variant, workers): medians over legs."""
+    groups = defaultdict(list)
+    for r in rows:
+        groups[(r["build"], r["fastokens_threads"], r["variant"], r["threads"])].append(r)
+    out = {}
+    for key, group in groups.items():
+        tok_s = [int(r["tokens"]) / float(r["seconds"]) for r in group]
+        cpu = [float(r["cpu_seconds"]) / float(r["seconds"]) for r in group]
+        out[key] = {"mtok_s": median(tok_s) / 1e6, "cpu_ratio": median(cpu), "legs": len(group), "prompts": int(group[0]["prompts"])}
+    return out
+
+
 def markdown_table(headers, rows):
     lines = ["| " + " | ".join(str(h) for h in headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
     lines += ["| " + " | ".join(str(c) for c in r) + " |" for r in rows]
@@ -91,22 +128,35 @@ def markdown_table(headers, rows):
 
 
 def latency_table(summary, columns, buckets, metric="median_ms"):
-    """Median ms per prompt; every column after the first also shows its speed-up over the first."""
-    headers = ["bucket", "tokens (median)"] + [label for label, *_ in columns]
+    """One row per bucket; every column after the first shows its speed-up over
+    its baseline (its own, if given, else the first column)."""
+    headers = ["bucket", "tokens (median)"] + [col[0] for col in columns]
+    first = tuple(columns[0][1:4])
     rows = []
     for bucket in buckets:
-        cells = [summary.get((build, threads, variant, bucket)) for _, build, threads, variant in columns]
-        base = cells[0]
-        row = [bucket, f"{base['median_tokens']:,.0f}" if base else DASH]
-        for i, cell in enumerate(cells):
+        base_cell = summary.get(first + (bucket,))
+        row = [bucket, f"{base_cell['median_tokens']:,.0f}" if base_cell else DASH]
+        for i, col in enumerate(columns):
+            cell = summary.get(tuple(col[1:4]) + (bucket,))
+            baseline = summary.get(tuple(col[4] if len(col) > 4 else first) + (bucket,))
             if cell is None:
                 row.append(DASH)
-            elif i == 0 or base is None:
+            elif i == 0 or baseline is None:
                 row.append(f"{cell[metric]:.2f}")
             else:
-                row.append(f"{cell[metric]:.2f} ({base[metric] / cell[metric]:.1f}×)")
+                row.append(f"{cell[metric]:.2f} ({baseline[metric] / cell[metric]:.1f}×)")
         rows.append(row)
     return markdown_table(headers, rows)
+
+
+def spread_table(rows, columns):
+    spread = leg_spread(rows)
+    body = []
+    for col in columns:
+        values = [v for k, v in spread.items() if k[:3] == tuple(col[1:4])]
+        if values:
+            body.append([col[0], f"{100 * max(values):.1f}%", f"{100 * median(values):.1f}%"])
+    return markdown_table(["column", "largest spread (any bucket)", "median spread"], body)
 
 
 def _tally_cell(tally):
@@ -154,6 +204,13 @@ def _read_csv(paths):
     return rows
 
 
+def _mb(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _env_section(env):
     lines = ["## Setup", ""]
     for key in ("machine", "os", "power", "rustc", "smg_commit", "fastokens", "tokenizers", "corpus_sha256", "rounds", "builds"):
@@ -167,72 +224,118 @@ def _env_section(env):
     return "\n".join(lines)
 
 
+def _present(columns, summary):
+    return [c for c in columns if any(k[:3] == tuple(c[1:4]) for k in summary)]
+
+
+def _model_section(model_dir):
+    out = [f"## {model_dir.name}", ""]
+    parity = sorted((model_dir / "parity").glob("*.json"))
+    if parity:
+        vocab = sorted({json.loads(p.read_text()).get("vocab", {}).get("differences", DASH) for p in parity}, key=str)
+        out += [
+            "### Token-id parity against SMG (mismatches / inputs)",
+            "",
+            markdown_table(
+                ["build", "model", "fastokens threads", "candidate", "chat (add_special_tokens=false)", "embeddings (true)"],
+                parity_rows(parity),
+            ),
+            "",
+            f"`id_to_token` differences over the whole vocabulary (SMG vs fastokens): {', '.join(str(v) for v in vocab)}",
+            "",
+        ]
+    timing = _read_csv(model_dir.glob("timing-*.csv"))
+    if timing:
+        summary = summarize_timing(timing)
+        cols = _present(LATENCY_COLUMNS, summary)
+        out += [
+            "### Encode latency on fresh prompts, median ms per prompt (speed-up), caches off",
+            "",
+            "Every backend first encodes a separate warm-up prompt set, so its caches hold common word pieces but never the timed prompt.",
+            "",
+            latency_table(summary, cols, BUCKETS),
+            "",
+            "### p90 across the bucket's prompts (ms; spread over prompt sizes, not tail latency)",
+            "",
+            latency_table(summary, cols, BUCKETS, metric="p90_ms"),
+            "",
+            "### CPU ms per prompt (all threads; fastokens can split one large encode across cores)",
+            "",
+            latency_table(summary, cols, BUCKETS, metric="cpu_median_ms"),
+            "",
+            "### Stability: spread of per-leg medians",
+            "",
+            spread_table(timing, cols),
+            "",
+        ]
+    repeat = _read_csv(model_dir.glob("repeat-*.csv"))
+    if repeat:
+        summary = summarize_timing(repeat)
+        out += [
+            "### Warm caches: exact repeats (warm-up on the timed prompts themselves), median ms",
+            "",
+            latency_table(summary, _present(REPEAT_COLUMNS, summary), BUCKETS),
+            "",
+        ]
+    turns = _read_csv(model_dir.glob("turns-*.csv"))
+    if turns:
+        summary = summarize_timing(turns)
+        out += [
+            "### Growing chats (multi-turn): median ms per turn, every turn re-sends the whole history",
+            "",
+            latency_table(summary, _present(TURN_COLUMNS, summary), ["16k", "50k"]),
+            "",
+        ]
+    throughput = _read_csv(model_dir.glob("throughput-*.csv"))
+    if throughput:
+        cells = summarize_throughput(throughput)
+        rows = [
+            [build, variant, threads, workers, f"{c['mtok_s']:.2f}", f"{c['cpu_ratio']:.2f}", c["legs"], c["prompts"]]
+            for (build, threads, variant, workers), c in sorted(cells.items(), key=lambda kv: (kv[0][0], kv[0][2], int(kv[0][3])))
+        ]
+        out += [
+            "### Throughput: one pass over fresh prompts, N workers on one shared queue (median over legs)",
+            "",
+            markdown_table(["build", "variant", "fastokens threads", "workers", "M tokens/s", "CPU/wall", "legs", "prompts"], rows),
+            "",
+        ]
+    loads = _read_csv(model_dir.glob("load-*.csv"))
+    if loads:
+        rss = {r["variant"]: _mb(r.get("max_rss_mb")) for r in _read_csv(model_dir.glob("rss.csv"))}
+        runtime = {r["variant"]: _mb(r.get("max_rss_mb")) for r in _read_csv(model_dir.glob("rss_runtime.csv"))}
+        base = rss.get("none")
+        loaded = {r["variant"] for r in loads}
+        rows = []
+        for r in loads:
+            load_mb, run_mb = rss.get(r["variant"]), runtime.get(r["variant"])
+            rows.append(
+                [
+                    r["variant"],
+                    f"{float(r['median_ms']):.0f}",
+                    f"{load_mb - base:.0f}" if load_mb is not None and base is not None else DASH,
+                    f"{run_mb - base:.0f}" if run_mb is not None and base is not None else DASH,
+                ]
+            )
+        rows += [
+            [variant, DASH, DASH, f"{mb - base:.0f}"]
+            for variant, mb in runtime.items()
+            if variant not in loaded and mb is not None and base is not None
+        ]
+        out += [
+            "### Load time and memory (MB above an empty process)",
+            "",
+            markdown_table(["backend", "load ms (median)", "after load", "after a full-concurrency pass"], rows),
+            "",
+        ]
+    return out
+
+
 def render_report(run_dir):
     run_dir = Path(run_dir)
     env = json.loads((run_dir / "env.json").read_text(encoding="utf-8")) if (run_dir / "env.json").exists() else {}
     out = [f"# Encode benchmark results ({run_dir.name})", "", _env_section(env), ""]
     for model_dir in sorted(p for p in run_dir.iterdir() if p.is_dir()):
-        model = model_dir.name
-        out += [f"## {model}", ""]
-        parity = sorted((model_dir / "parity").glob("*.json"))
-        if parity:
-            out += [
-                "### Token-id parity against SMG (mismatches / inputs)",
-                "",
-                markdown_table(
-                    ["build", "model", "fastokens threads", "candidate", "chat (add_special_tokens=false)", "embeddings (true)"],
-                    parity_rows(parity),
-                ),
-                "",
-            ]
-        timing = _read_csv(model_dir.glob("timing-*.csv"))
-        if timing:
-            summary = summarize_timing(timing)
-            present = [c for c in LATENCY_COLUMNS if any(k[:3] == c[1:] for k in summary)]
-            out += [
-                "### Encode latency, median ms per prompt (speed-up vs SMG as shipped), caches off",
-                "",
-                latency_table(summary, present, BUCKETS),
-                "",
-                "### p90 ms per prompt",
-                "",
-                latency_table(summary, present, BUCKETS, metric="p90_ms"),
-                "",
-                "### CPU ms per prompt (all threads; fastokens can split one large encode across cores)",
-                "",
-                latency_table(summary, present, BUCKETS, metric="cpu_median_ms"),
-                "",
-            ]
-        throughput = _read_csv(model_dir.glob("throughput-*.csv"))
-        if throughput:
-            rows = [
-                [
-                    r["build"],
-                    r["variant"],
-                    r["fastokens_threads"],
-                    r["threads"],
-                    f"{int(r['tokens']) / float(r['seconds']) / 1e6:.2f}",
-                    f"{int(r['prompts']) / float(r['seconds']):.1f}",
-                    f"{float(r['cpu_seconds']) / float(r['seconds']):.2f}",
-                ]
-                for r in throughput
-            ]
-            out += [
-                "### Throughput with N workers on one shared prompt queue",
-                "",
-                markdown_table(["build", "variant", "fastokens threads", "workers", "M tokens/s", "prompts/s", "CPU/wall"], rows),
-                "",
-            ]
-        loads = _read_csv(model_dir.glob("load-*.csv"))
-        rss = {r["variant"]: r for r in _read_csv(model_dir.glob("rss.csv"))}
-        if loads:
-            base_rss = float(rss["none"]["max_rss_mb"]) if "none" in rss else None
-            rows = []
-            for r in loads:
-                mem = rss.get(r["variant"])
-                extra = f"{float(mem['max_rss_mb']) - base_rss:.0f}" if mem and base_rss is not None else DASH
-                rows.append([r["variant"], f"{float(r['median_ms']):.0f}", extra])
-            out += ["### Load time and memory", "", markdown_table(["backend", "load ms (median)", "extra peak RSS MB"], rows), ""]
+        out += _model_section(model_dir)
     return "\n".join(out).rstrip() + "\n"
 
 

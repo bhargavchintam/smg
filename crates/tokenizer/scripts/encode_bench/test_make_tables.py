@@ -134,5 +134,59 @@ class ParitySummaryTest(unittest.TestCase):
                 mt.parity_rows([path])
 
 
+class ColumnBaselineTest(unittest.TestCase):
+    def test_a_column_can_name_its_own_baseline(self):
+        rows = [row("a", "2k", "smg", 10), row("a", "2k", "smg", 8, threads="1"), row("a", "2k", "fastokens", 2, threads="1")]
+        columns = [("SMG", "z", "default", "smg"), ("fastokens, 1 thread", "z", "1", "fastokens", ("z", "1", "smg"))]
+        table = mt.latency_table(mt.summarize_timing(rows), columns, buckets=["2k"])
+        self.assertIn("2.00 (4.0×)", table)
+
+
+class LegSpreadTest(unittest.TestCase):
+    def test_spread_is_range_of_leg_medians_over_their_median(self):
+        rows = []
+        for leg, (a, b) in enumerate([(10, 20), (12, 22), (11, 21)]):
+            rows += [row("a", "2k", "smg", a, rnd=leg), row("b", "2k", "smg", b, rnd=leg)]
+        self.assertAlmostEqual(mt.leg_spread(rows)[("z", "default", "smg", "2k")], (17 - 15) / 16)
+
+
+class ThroughputSummaryTest(unittest.TestCase):
+    def test_median_over_legs(self):
+        rows = [
+            {"build": "z", "fastokens_threads": "default", "round": str(leg), "variant": "smg", "threads": "4",
+             "seconds": sec, "prompts": "10", "tokens": "1000", "cpu_seconds": cpu}
+            for leg, (sec, cpu) in enumerate([("1.0", "4.0"), ("2.0", "8.0"), ("0.5", "2.0")])
+        ]
+        cell = mt.summarize_throughput(rows)[("z", "default", "smg", "4")]
+        self.assertAlmostEqual(cell["mtok_s"], 1000 / 1.0 / 1e6)
+        self.assertAlmostEqual(cell["cpu_ratio"], 4.0)
+        self.assertEqual(cell["legs"], 3)
+
+
+class ReportTest(unittest.TestCase):
+    def test_missing_rss_value_renders_as_dash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "qwen3"
+            model.mkdir()
+            (model / "load-z.csv").write_text("variant,repeat,median_ms\nnone,5,0.0\nsmg,5,100.0\n")
+            (model / "rss.csv").write_text("variant,max_rss_mb\nnone,\nsmg,150.0\n")
+            report = mt.render_report(tmp)
+        self.assertIn("| smg | 100 | — |", report)
+
+    def test_sections_and_labels(self):
+        header = "build,fastokens_threads,round,prompt,bucket,kind,bytes,tokens,variant,wall_ns,cpu_ns\n"
+        line = "z,default,0,a,2k,code,4000,1000,smg,1000000,1000000\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "qwen3"
+            model.mkdir()
+            for name in ("timing-z-leg00-tdefault.csv", "repeat-z-leg00.csv", "turns-z-leg00.csv"):
+                (model / name).write_text(header + line)
+            report = mt.render_report(tmp)
+        self.assertIn("fresh prompts", report)
+        self.assertIn("p90 across the bucket's prompts", report)
+        self.assertIn("exact repeats", report)
+        self.assertIn("multi-turn", report)
+
+
 if __name__ == "__main__":
     unittest.main()
