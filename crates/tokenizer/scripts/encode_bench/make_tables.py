@@ -25,6 +25,8 @@ CONTROLS = ("smg_again", "control_drop_last")
 # (label, build, fastokens threads, variant); the first column is the baseline.
 LATENCY_COLUMNS = [
     ("SMG as shipped", "z", "default", "smg"),
+    ("SMG, tokenizers at O2", "tok", "default", "smg"),
+    ("SMG, tokenizers+onig at O2", "toksys", "default", "smg"),
     ("SMG, HF hot deps at O2", "hotdeps", "default", "smg"),
     ("SMG, all O2", "o2", "default", "smg"),
     ("HF encode_fast", "z", "default", "hf_encode_fast"),

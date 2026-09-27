@@ -37,6 +37,17 @@ class BuildArgsTest(unittest.TestCase):
         self.assertIn("profile.release.package.onig_sys.opt-level=2", args)
         self.assertNotIn("profile.release.opt-level=2", args)
 
+    def test_ablation_builds_raise_one_crate_set_each(self):
+        self.assertIn("tok", rb.BUILDS)
+        self.assertIn("toksys", rb.BUILDS)
+        tok = rb.build_args("tok")
+        self.assertIn("profile.release.package.tokenizers.opt-level=2", tok)
+        self.assertNotIn("profile.release.package.onig_sys.opt-level=2", tok)
+        toksys = rb.build_args("toksys")
+        for crate in ("tokenizers", "onig", "onig_sys"):
+            self.assertIn(f"profile.release.package.{crate}.opt-level=2", toksys)
+        self.assertNotIn("profile.release.package.daachorse.opt-level=2", toksys)
+
     def test_unknown_build_is_rejected(self):
         with self.assertRaises(ValueError):
             rb.build_args("nope")

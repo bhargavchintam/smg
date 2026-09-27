@@ -42,9 +42,18 @@ HF_HOT_DEPS = [
     "unicode-segmentation",
     "unicode_categories",
 ]
+
+
+def _opt2(crates):
+    return [arg for crate in crates for arg in ("--config", f"profile.release.package.{crate}.opt-level=2")]
+
+
 BUILDS = {
     "z": [],
-    "hotdeps": [arg for crate in HF_HOT_DEPS for arg in ("--config", f"profile.release.package.{crate}.opt-level=2")],
+    # Ablation: which of HF's encode-path crates carry the opt-level win.
+    "tok": _opt2(["tokenizers"]),
+    "toksys": _opt2(["tokenizers", "onig", "onig_sys"]),
+    "hotdeps": _opt2(HF_HOT_DEPS),
     "o2": ["--config", "profile.release.opt-level=2"],
 }
 DEFAULT_MODELS = {"qwen3": "Qwen__Qwen3-4B-Instruct-2507@", "deepseek-v3.2": "deepseek-ai__DeepSeek-V3.2@"}
