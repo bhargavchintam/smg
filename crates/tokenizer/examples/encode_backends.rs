@@ -12,16 +12,25 @@
 //!     add_special_tokens=false (chat) and true (embeddings), then replay
 //!     growing conversations through SMG's L0/L1 caches.
 //! time    --model DIR --prompts FILE --variants a,b --rounds N --out FILE.csv
-//!         [--build LABEL] [--round-offset K]
+//!         [--warmup FILE] [--build LABEL] [--round-offset K]
 //!     Wall and CPU time of every encode, variant order rotated per prompt.
+//!     With --warmup the backends first encode that (disjoint) prompt set, so
+//!     the timed prompts are new to every cache; without it they warm up on
+//!     the timed prompts themselves (exact repeats).
+//! turns   --model DIR --conversations FILE --variants a,b --out FILE.csv
+//!         [--warmup FILE] [--build LABEL] [--round-offset K]
+//!     Multi-turn chats: every user turn re-sends the whole history; turns of
+//!     different chats are interleaved; each variant keeps its caches.
 //! throughput --model DIR --prompts FILE --variants a,b --threads 1,4 --out FILE.csv
-//!         [--seconds S] [--build LABEL]
-//!     Tokens/s with N workers pulling prompts from one shared queue.
+//!         [--warmup FILE] [--build LABEL] [--round-offset K]
+//!     One pass over the prompts with N workers pulling from a shared queue
+//!     (every prompt encoded exactly once).
 //! load    --model DIR --variants a,b [--repeat N] [--out FILE.csv]
 //!     Backend construction time (variant `none` loads nothing: RSS baseline).
 //! ```
 //!
-//! Variants: smg (as shipped), hf_encode, hf_encode_fast, fastokens.
+//! Variants: smg (as shipped), hf_encode, hf_encode_fast, fastokens, and for
+//! `turns` also smg_cached / fastokens_cached (SMG's L0+L1 caches on top).
 //! `FASTOKENS_BPE_THREADS` is read once per process; set it per run.
 //!
 //! Build it with `--release` so it uses the profile SMG ships.
@@ -56,11 +65,13 @@ use llm_tokenizer::{
 };
 use serde_json::{json, Value};
 
+// Same allocator (and the same targets) as the gateway binary.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const USAGE: &str =
-    "usage: encode_backends <render|parity|time|throughput|load> --option value ...";
+    "usage: encode_backends <render|parity|time|turns|throughput|load> --option value ...";
 /// Conversations per bucket replayed turn by turn through the caches.
 const CACHE_REPLAY_PER_BUCKET: usize = 4;
 const MAX_EXAMPLES: usize = 5;
@@ -73,6 +84,7 @@ fn main() -> Result<()> {
         "render" => render(&opts),
         "parity" => parity(&opts),
         "time" => timing(&opts),
+        "turns" => turns(&opts),
         "throughput" => throughput(&opts),
         "load" => load(&opts),
         _ => bail!(USAGE),
@@ -300,9 +312,9 @@ fn candidates(model: &Path, smg: &Arc<dyn Tokenizer>) -> Result<Vec<Candidate>> 
     if !json_path.exists() {
         return Ok(out);
     }
-    let fast = Arc::new(fastokens_from_json(&json_path)?);
+    let fast = Arc::new(load_fastokens(&json_path)?);
     out.push(Candidate {
-        name: "fastokens_json",
+        name: "fastokens",
         encode: Box::new(move |text, special| Ok(fast.encode_with_special_tokens(text, special)?)),
     });
     let fast_file = fastokens::Tokenizer::from_file(&json_path)?;
@@ -337,11 +349,29 @@ fn candidates(model: &Path, smg: &Arc<dyn Tokenizer>) -> Result<Vec<Candidate>> 
     Ok(out)
 }
 
-/// fastokens built from the raw `tokenizer.json` only. `from_file` also merges
-/// `tokenizer_config.json` added tokens, which SMG does not do.
-fn fastokens_from_json(path: &Path) -> Result<fastokens::Tokenizer> {
-    let raw: Value = serde_json::from_str(&fs::read_to_string(path)?)?;
-    Ok(fastokens::Tokenizer::from_json(raw)?)
+/// fastokens from `tokenizer.json` alone. `from_file` parses straight into
+/// fastokens' own types (no generic JSON tree), and linking the file into an
+/// empty directory keeps it from also merging `tokenizer_config.json` added
+/// tokens, which SMG does not do.
+fn load_fastokens(path: &Path) -> Result<fastokens::Tokenizer> {
+    let dir = tempfile::tempdir()?;
+    let isolated = dir.path().join("tokenizer.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(fs::canonicalize(path)?, &isolated)?;
+    }
+    #[cfg(not(unix))]
+    fs::copy(path, &isolated)?;
+    Ok(fastokens::Tokenizer::from_file(&isolated)?)
+}
+
+/// SMG's L0 (exact) and L1 (prefix) caches, both on.
+fn l0_l1_config() -> CacheConfig {
+    CacheConfig {
+        enable_l1: true,
+        ..CacheConfig::default()
+    }
 }
 
 #[derive(Default)]
@@ -444,19 +474,14 @@ fn parity(opts: &Opts) -> Result<()> {
 /// message) through SMG's L0+L1 caches, over SMG's own tokenizer and over the
 /// fastokens-backed wrapper, and compare with an uncached SMG encode.
 fn cache_replay(model: &Path, smg: &Arc<dyn Tokenizer>, conversations: &[Value]) -> Result<Value> {
-    let config = CacheConfig {
-        enable_l1: true,
-        ..CacheConfig::default()
-    };
+    let config = l0_l1_config();
     let mut cached: Vec<(&str, CachedTokenizer)> = vec![(
         "smg_cached",
         CachedTokenizer::new(smg.clone(), config.clone()),
     )];
     if model.join("tokenizer.json").exists() {
-        let wrapper = FastEncodeTokenizer::new(
-            fastokens_from_json(&model.join("tokenizer.json"))?,
-            smg.clone(),
-        );
+        let wrapper =
+            FastEncodeTokenizer::new(load_fastokens(&model.join("tokenizer.json"))?, smg.clone());
         cached.push((
             "fastokens_cached",
             CachedTokenizer::new(Arc::new(wrapper), config),
@@ -511,7 +536,7 @@ fn vocab_diff(model: &Path, smg: &dyn Tokenizer) -> Result<Value> {
     if !json_path.exists() {
         return Ok(json!({"differences": "n/a"}));
     }
-    let fast = fastokens_from_json(&json_path)?;
+    let fast = load_fastokens(&json_path)?;
     let limit = smg.vocab_size().max(fast.vocab_size()) as u32 + 2048;
     let mut differences = 0usize;
     let mut examples = Vec::new();
@@ -552,7 +577,8 @@ fn load_hf(path: &Path) -> Result<tokenizers::Tokenizer> {
 /// - `smg`: SMG as shipped (`HuggingFaceTokenizer::encode`, or tiktoken-rs)
 /// - `hf_encode`: raw HF `encode` (computes offsets SMG never reads)
 /// - `hf_encode_fast`: raw HF `encode_fast` (no offsets)
-/// - `fastokens`: fastokens built from the raw `tokenizer.json`
+/// - `fastokens`: fastokens built from `tokenizer.json` alone
+/// - `smg_cached` / `fastokens_cached`: the same behind SMG's L0+L1 caches
 fn variant_encoder(model: &Path, smg: &Arc<dyn Tokenizer>, name: &str) -> Result<TimedEncode> {
     let json_path = model.join("tokenizer.json");
     Ok(match name {
@@ -574,10 +600,21 @@ fn variant_encoder(model: &Path, smg: &Arc<dyn Tokenizer>, name: &str) -> Result
             })
         }
         "fastokens" => {
-            let fast = fastokens_from_json(&json_path)?;
+            let fast = load_fastokens(&json_path)?;
             Box::new(move |text| Ok(fast.encode_with_special_tokens(text, false)?.len()))
         }
-        other => bail!("unknown variant {other:?} (smg, hf_encode, hf_encode_fast, fastokens)"),
+        "smg_cached" => {
+            let cached = CachedTokenizer::new(smg.clone(), l0_l1_config());
+            Box::new(move |text| Ok(cached.encode(text, false)?.token_ids().len()))
+        }
+        "fastokens_cached" => {
+            let wrapper = FastEncodeTokenizer::new(load_fastokens(&json_path)?, smg.clone());
+            let cached = CachedTokenizer::new(Arc::new(wrapper), l0_l1_config());
+            Box::new(move |text| Ok(cached.encode(text, false)?.token_ids().len()))
+        }
+        other => bail!(
+            "unknown variant {other:?} (smg, hf_encode, hf_encode_fast, fastokens, smg_cached, fastokens_cached)"
+        ),
     })
 }
 
@@ -589,10 +626,12 @@ fn load_variant(model: &Path, name: &str) -> Result<Duration> {
         "none" => Box::new(()),
         "smg" => Box::new(load_smg(model)?),
         "hf_encode" | "hf_encode_fast" => Box::new(load_hf(&json_path)?),
-        "fastokens" => Box::new(fastokens_from_json(&json_path)?),
-        other => {
-            bail!("unknown variant {other:?} (none, smg, hf_encode, hf_encode_fast, fastokens)")
-        }
+        "fastokens" => Box::new(load_fastokens(&json_path)?),
+        // The proposed backend keeps SMG's tokenizer (decode, templates) too.
+        "smg_fastokens" => Box::new((load_smg(model)?, load_fastokens(&json_path)?)),
+        other => bail!(
+            "unknown variant {other:?} (none, smg, hf_encode, hf_encode_fast, fastokens, smg_fastokens)"
+        ),
     };
     let elapsed = start.elapsed();
     drop(loaded);
@@ -621,12 +660,7 @@ fn timing(opts: &Opts) -> Result<()> {
     let build = opts.get("build").unwrap_or("local");
     let threads = fastokens_threads_label();
 
-    for prompt in &prompts {
-        let text = prompt["text"].as_str().unwrap_or_default();
-        for (_, encode) in &variants {
-            black_box(encode(text)?);
-        }
-    }
+    warm_up(opts, &variants, &prompts)?;
     let out_path = opts.path("out")?;
     let mut out = BufWriter::new(fs::File::create(&out_path)?);
     writeln!(
@@ -663,8 +697,25 @@ fn timing(opts: &Opts) -> Result<()> {
     Ok(())
 }
 
-/// Saturation run: `threads` workers pull prompts from one shared queue for
-/// `seconds`, like concurrent requests on the gateway's blocking pool.
+/// Encode `--warmup` (or, without it, the timed prompts) once with every
+/// variant before timing.
+fn warm_up(opts: &Opts, variants: &[(&str, TimedEncode)], timed: &[Value]) -> Result<()> {
+    let warmup = match opts.path("warmup") {
+        Ok(path) => read_jsonl(&path)?,
+        Err(_) => timed.to_vec(),
+    };
+    for prompt in &warmup {
+        let text = prompt["text"].as_str().unwrap_or_default();
+        for (_, encode) in variants {
+            black_box(encode(text)?);
+        }
+    }
+    Ok(())
+}
+
+/// Saturation run: one pass over the prompts with N workers pulling from a
+/// shared queue, like concurrent requests on the gateway's blocking pool.
+/// Every prompt is encoded exactly once per (variant, workers) pass.
 fn throughput(opts: &Opts) -> Result<()> {
     let model = opts.path("model")?;
     let smg = load_smg(&model)?;
@@ -672,23 +723,30 @@ fn throughput(opts: &Opts) -> Result<()> {
         .iter()
         .map(|p| p["text"].as_str().unwrap_or_default().to_string())
         .collect();
-    let seconds: f64 = opts.get("seconds").unwrap_or("10").parse()?;
     let threads: Vec<usize> = opts
         .get("threads")?
         .split(',')
         .map(str::parse)
         .collect::<Result<_, _>>()?;
     let build = opts.get("build").unwrap_or("local");
+    let offset: usize = opts.get("round-offset").unwrap_or("0").parse()?;
     let fast_threads = fastokens_threads_label();
+    let names: Vec<&str> = opts.get("variants")?.split(',').collect();
+    let variants = rotated_order(names.len(), 0, offset)
+        .into_iter()
+        .map(|i| Ok((names[i], variant_encoder(&model, &smg, names[i])?)))
+        .collect::<Result<Vec<_>>>()?;
+    // Warm up on --warmup only: warming on the timed prompts would make the
+    // single pass a pass over exact repeats.
+    warm_up(opts, &variants, &[])?;
     let mut out = BufWriter::new(fs::File::create(opts.path("out")?)?);
     writeln!(
         out,
-        "build,fastokens_threads,variant,threads,seconds,prompts,tokens,cpu_seconds"
+        "build,fastokens_threads,round,variant,threads,seconds,prompts,tokens,cpu_seconds"
     )?;
-    for name in opts.get("variants")?.split(',') {
-        let encode = variant_encoder(&model, &smg, name)?;
+    for (name, encode) in &variants {
         for &workers in &threads {
-            let run = run_throughput(&encode, &texts, workers, Duration::from_secs_f64(seconds))?;
+            let run = run_throughput(encode, &texts, workers)?;
             let wall = run.wall.as_secs_f64();
             println!(
                 "{name:<16} threads={workers:<3} {:>10.0} tokens/s  {:>7.1} prompts/s  cpu/wall={:.2}",
@@ -698,7 +756,7 @@ fn throughput(opts: &Opts) -> Result<()> {
             );
             writeln!(
                 out,
-                "{build},{fast_threads},{name},{workers},{wall:.3},{},{},{:.3}",
+                "{build},{fast_threads},{offset},{name},{workers},{wall:.3},{},{},{:.3}",
                 run.prompts,
                 run.tokens,
                 run.cpu.as_secs_f64(),
@@ -715,28 +773,27 @@ struct ThroughputRun {
     cpu: Duration,
 }
 
-fn run_throughput(
-    encode: &TimedEncode,
-    texts: &[String],
-    workers: usize,
-    duration: Duration,
-) -> Result<ThroughputRun> {
+fn run_throughput(encode: &TimedEncode, texts: &[String], workers: usize) -> Result<ThroughputRun> {
+    if texts.is_empty() || workers == 0 {
+        bail!("throughput needs at least one prompt and one worker");
+    }
     let next = AtomicUsize::new(0);
     let prompts = AtomicUsize::new(0);
     let tokens = AtomicUsize::new(0);
     let cpu_start = ProcessTime::now();
     let start = Instant::now();
-    let deadline = start + duration;
     std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| -> Result<()> {
-                    while Instant::now() < deadline {
-                        let i = next.fetch_add(1, Ordering::Relaxed) % texts.len();
-                        tokens.fetch_add(encode(&texts[i])?, Ordering::Relaxed);
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(text) = texts.get(i) else {
+                            return Ok(());
+                        };
+                        tokens.fetch_add(encode(text)?, Ordering::Relaxed);
                         prompts.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(())
                 })
             })
             .collect();
@@ -753,6 +810,90 @@ fn run_throughput(
         wall: start.elapsed(),
         cpu: cpu_start.elapsed(),
     })
+}
+
+/// Round-robin order over chats: turn 0 of every chat, then turn 1, ... so
+/// the caches see interleaved traffic, as on a busy gateway.
+fn turn_schedule(turns: &[usize]) -> Vec<(usize, usize)> {
+    let longest = turns.iter().copied().max().unwrap_or(0);
+    (0..longest)
+        .flat_map(|k| {
+            turns
+                .iter()
+                .enumerate()
+                .filter(move |&(_, &n)| k < n)
+                .map(move |(chat, _)| (chat, k))
+        })
+        .collect()
+}
+
+/// Multi-turn chats (16k and 50k buckets): each user turn re-sends the whole
+/// history, rendered with SMG's chat template. One tokenizer per variant for
+/// the whole run, so its caches carry over between turns.
+fn turns(opts: &Opts) -> Result<()> {
+    let model = opts.path("model")?;
+    let smg = load_smg(&model)?;
+    let variants = opts
+        .get("variants")?
+        .split(',')
+        .map(|name| Ok((name, variant_encoder(&model, &smg, name)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let offset: usize = opts.get("round-offset").unwrap_or("0").parse()?;
+    let build = opts.get("build").unwrap_or("local");
+    let threads = fastokens_threads_label();
+    let chats: Vec<Value> = read_jsonl(&opts.path("conversations")?)?
+        .into_iter()
+        .filter(|c| matches!(c["bucket"].as_str(), Some("16k" | "50k")))
+        .collect();
+    let mut rendered: Vec<Vec<(usize, String)>> = Vec::with_capacity(chats.len());
+    for chat in &chats {
+        let messages = chat["messages"].as_array().context("messages")?;
+        let mut prefixes = Vec::new();
+        for upto in (2..=messages.len()).filter(|&k| messages[k - 1]["role"] == "user") {
+            prefixes.push((
+                upto,
+                render_conversation(smg.as_ref(), chat, Some(upto))?.text,
+            ));
+        }
+        rendered.push(prefixes);
+    }
+    warm_up(opts, &variants, &[])?;
+
+    let out_path = opts.path("out")?;
+    let mut out = BufWriter::new(fs::File::create(&out_path)?);
+    writeln!(
+        out,
+        "build,fastokens_threads,round,prompt,bucket,kind,bytes,tokens,variant,wall_ns,cpu_ns"
+    )?;
+    let schedule = turn_schedule(&rendered.iter().map(Vec::len).collect::<Vec<_>>());
+    for (i, &(chat, k)) in schedule.iter().enumerate() {
+        let (upto, text) = &rendered[chat][k];
+        for v in rotated_order(variants.len(), i, offset) {
+            let (name, encode) = &variants[v];
+            let cpu_start = ProcessTime::now();
+            let wall_start = Instant::now();
+            let tokens = black_box(encode(black_box(text))?);
+            let wall = wall_start.elapsed();
+            let cpu = cpu_start.elapsed();
+            writeln!(
+                out,
+                "{build},{threads},{offset},{}@{upto},{},{},{},{tokens},{name},{},{}",
+                chats[chat]["id"].as_str().unwrap_or_default(),
+                chats[chat]["bucket"].as_str().unwrap_or_default(),
+                chats[chat]["kind"].as_str().unwrap_or_default(),
+                text.len(),
+                wall.as_nanos(),
+                cpu.as_nanos(),
+            )?;
+        }
+    }
+    out.flush()?;
+    println!(
+        "wrote {} turn timings to {}",
+        schedule.len() * variants.len(),
+        out_path.display()
+    );
+    Ok(())
 }
 
 /// Median construction time per backend over `repeat` loads.
@@ -974,6 +1115,61 @@ mod tests {
         assert_eq!(encode("Hello world test").unwrap(), expected);
     }
 
+    fn mock_encode(name: &str) -> TimedEncode {
+        let smg = create_tokenizer_from_file("mock").unwrap();
+        variant_encoder(Path::new("/nonexistent"), &smg, name).unwrap()
+    }
+
+    #[test]
+    fn throughput_encodes_every_prompt_exactly_once() {
+        let encode = mock_encode("smg");
+        let texts: Vec<String> = (0..50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    "Hello world"
+                } else {
+                    "test token"
+                }
+                .to_string()
+            })
+            .collect();
+        let run = run_throughput(&encode, &texts, 4).unwrap();
+        assert_eq!(run.prompts, 50);
+        assert_eq!(run.tokens, 100);
+    }
+
+    #[test]
+    fn throughput_rejects_an_empty_prompt_list() {
+        let encode = mock_encode("smg");
+        assert!(run_throughput(&encode, &[], 2).is_err());
+    }
+
+    #[test]
+    fn turn_schedule_interleaves_conversations_round_robin() {
+        assert_eq!(
+            turn_schedule(&[2, 3, 1]),
+            vec![(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (1, 2)]
+        );
+        assert!(turn_schedule(&[]).is_empty());
+    }
+
+    #[test]
+    fn cached_variant_matches_uncached_token_counts() {
+        let plain = mock_encode("smg");
+        let cached = mock_encode("smg_cached");
+        for text in ["Hello world", "Hello world test", "Hello world"] {
+            assert_eq!(cached(text).unwrap(), plain(text).unwrap(), "{text}");
+        }
+    }
+
+    #[test]
+    fn smg_fastokens_is_a_known_load_variant() {
+        let err = load_variant(Path::new("/nonexistent"), "smg_fastokens")
+            .err()
+            .unwrap();
+        assert!(!err.to_string().contains("unknown variant"), "{err}");
+    }
+
     /// Needs a downloaded model: ENCODE_BENCH_MODEL_DIR=/path/to/model \
     ///   cargo test -p llm-tokenizer --example encode_backends -- --ignored
     #[test]
@@ -981,7 +1177,7 @@ mod tests {
     fn fast_encode_wrapper_matches_smg_and_delegates_decode() {
         let dir = PathBuf::from(std::env::var("ENCODE_BENCH_MODEL_DIR").unwrap());
         let smg = load_smg(&dir).unwrap();
-        let fast = fastokens_from_json(&dir.join("tokenizer.json")).unwrap();
+        let fast = load_fastokens(&dir.join("tokenizer.json")).unwrap();
         let wrapper = FastEncodeTokenizer::new(fast, smg.clone());
         for text in [
             "Hello, world!",
