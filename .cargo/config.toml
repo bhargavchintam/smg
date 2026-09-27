@@ -7,6 +7,10 @@ incremental = true
 # kernels. tikv-jemalloc-sys checks this target-qualified variable before the
 # generic JEMALLOC_SYS_WITH_LG_PAGE value, including during cross-compilation.
 AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = { value = "16", force = true }
+# fastokens depends on pcre2-sys; build the bundled PCRE2 statically instead of
+# linking whatever libpcre2 the host has (e.g. Homebrew), so runs compare the
+# same library everywhere.
+PCRE2_SYS_STATIC = "1"
 
 [target.aarch64-apple-darwin]
 rustflags = [
