@@ -11,7 +11,18 @@
 //!     Compare every candidate backend's token ids with SMG's, for both
 //!     add_special_tokens=false (chat) and true (embeddings), then replay
 //!     growing conversations through SMG's L0/L1 caches.
+//! time    --model DIR --prompts FILE --variants a,b --rounds N --out FILE.csv
+//!         [--build LABEL]
+//!     Wall and CPU time of every encode, variant order rotated per prompt.
+//! throughput --model DIR --prompts FILE --variants a,b --threads 1,4 --out FILE.csv
+//!         [--seconds S] [--build LABEL]
+//!     Tokens/s with N workers pulling prompts from one shared queue.
+//! load    --model DIR --variants a,b [--repeat N] [--out FILE.csv]
+//!     Backend construction time (variant `none` loads nothing: RSS baseline).
 //! ```
+//!
+//! Variants: smg (as shipped), hf_encode, hf_encode_fast, fastokens.
+//! `FASTOKENS_BPE_THREADS` is read once per process; set it per run.
 //!
 //! Build it with `--release` so it uses the profile SMG ships.
 #![expect(clippy::print_stdout, reason = "benchmark CLI prints its results")]
@@ -20,12 +31,18 @@ use std::{
     any::Any,
     collections::{BTreeMap, HashMap},
     fs,
+    hint::black_box,
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
+use cpu_time::ProcessTime;
 use llm_tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     chat_template::{
@@ -42,7 +59,8 @@ use serde_json::{json, Value};
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-const USAGE: &str = "usage: encode_backends <render|parity> --option value ...";
+const USAGE: &str =
+    "usage: encode_backends <render|parity|time|throughput|load> --option value ...";
 /// Conversations per bucket replayed turn by turn through the caches.
 const CACHE_REPLAY_PER_BUCKET: usize = 4;
 const MAX_EXAMPLES: usize = 5;
@@ -54,6 +72,9 @@ fn main() -> Result<()> {
     match command.as_str() {
         "render" => render(&opts),
         "parity" => parity(&opts),
+        "time" => timing(&opts),
+        "throughput" => throughput(&opts),
+        "load" => load(&opts),
         _ => bail!(USAGE),
     }
 }
@@ -291,7 +312,7 @@ fn candidates(model: &Path, smg: &Arc<dyn Tokenizer>) -> Result<Vec<Candidate>> 
             Ok(fast_file.encode_with_special_tokens(text, special)?)
         }),
     });
-    let hf = Arc::new(tokenizers::Tokenizer::from_file(&json_path).map_err(anyhow::Error::msg)?);
+    let hf = Arc::new(load_hf(&json_path)?);
     let hf_fast = hf.clone();
     out.push(Candidate {
         name: "hf_raw_encode",
@@ -510,6 +531,248 @@ fn vocab_diff(model: &Path, smg: &dyn Tokenizer) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Timing
+// ---------------------------------------------------------------------------
+
+/// Encodes one prompt with a named backend and returns its token count.
+type TimedEncode = Box<dyn Fn(&str) -> Result<usize> + Send + Sync>;
+
+/// Variant order for one prompt in one round: rotate so every variant runs
+/// first, second, ... equally often (no fixed warm-cache advantage).
+fn rotated_order(n: usize, prompt: usize, round: usize) -> Vec<usize> {
+    (0..n).map(|i| (i + prompt + round) % n).collect()
+}
+
+fn load_hf(path: &Path) -> Result<tokenizers::Tokenizer> {
+    tokenizers::Tokenizer::from_file(path).map_err(anyhow::Error::msg)
+}
+
+/// The backends a timing run can compare, all with add_special_tokens=false
+/// (the chat path):
+/// - `smg`: SMG as shipped (`HuggingFaceTokenizer::encode`, or tiktoken-rs)
+/// - `hf_encode`: raw HF `encode` (computes offsets SMG never reads)
+/// - `hf_encode_fast`: raw HF `encode_fast` (no offsets)
+/// - `fastokens`: fastokens built from the raw `tokenizer.json`
+fn variant_encoder(model: &Path, smg: &Arc<dyn Tokenizer>, name: &str) -> Result<TimedEncode> {
+    let json_path = model.join("tokenizer.json");
+    Ok(match name {
+        "smg" => {
+            let tok = smg.clone();
+            Box::new(move |text| Ok(tok.encode(text, false)?.token_ids().len()))
+        }
+        "hf_encode" => {
+            let hf = load_hf(&json_path)?;
+            Box::new(move |text| Ok(hf.encode(text, false).map_err(anyhow::Error::msg)?.len()))
+        }
+        "hf_encode_fast" => {
+            let hf = load_hf(&json_path)?;
+            Box::new(move |text| {
+                Ok(hf
+                    .encode_fast(text, false)
+                    .map_err(anyhow::Error::msg)?
+                    .len())
+            })
+        }
+        "fastokens" => {
+            let fast = fastokens_from_json(&json_path)?;
+            Box::new(move |text| Ok(fast.encode_with_special_tokens(text, false)?.len()))
+        }
+        other => bail!("unknown variant {other:?} (smg, hf_encode, hf_encode_fast, fastokens)"),
+    })
+}
+
+/// Time to construct one backend from files already in the page cache.
+fn load_variant(model: &Path, name: &str) -> Result<Duration> {
+    let json_path = model.join("tokenizer.json");
+    let start = Instant::now();
+    let loaded: Box<dyn Any> = match name {
+        "none" => Box::new(()),
+        "smg" => Box::new(load_smg(model)?),
+        "hf_encode" | "hf_encode_fast" => Box::new(load_hf(&json_path)?),
+        "fastokens" => Box::new(fastokens_from_json(&json_path)?),
+        other => {
+            bail!("unknown variant {other:?} (none, smg, hf_encode, hf_encode_fast, fastokens)")
+        }
+    };
+    let elapsed = start.elapsed();
+    drop(loaded);
+    Ok(elapsed)
+}
+
+fn fastokens_threads_label() -> String {
+    std::env::var("FASTOKENS_BPE_THREADS").unwrap_or_else(|_| "default".into())
+}
+
+/// One encode per (round, prompt, variant), variants rotated per prompt and
+/// round; writes wall and process CPU time (all threads) for every encode.
+fn timing(opts: &Opts) -> Result<()> {
+    let model = opts.path("model")?;
+    let smg = load_smg(&model)?;
+    let variants = opts
+        .get("variants")?
+        .split(',')
+        .map(|name| Ok((name, variant_encoder(&model, &smg, name)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let prompts = read_jsonl(&opts.path("prompts")?)?;
+    let rounds: usize = opts.get("rounds")?.parse()?;
+    let build = opts.get("build").unwrap_or("local");
+    let threads = fastokens_threads_label();
+
+    for prompt in &prompts {
+        let text = prompt["text"].as_str().unwrap_or_default();
+        for (_, encode) in &variants {
+            black_box(encode(text)?);
+        }
+    }
+    let out_path = opts.path("out")?;
+    let mut out = BufWriter::new(fs::File::create(&out_path)?);
+    writeln!(
+        out,
+        "build,fastokens_threads,round,prompt,bucket,kind,bytes,tokens,variant,wall_ns,cpu_ns"
+    )?;
+    let mut rows = 0usize;
+    for round in 0..rounds {
+        for (i, prompt) in prompts.iter().enumerate() {
+            let text = prompt["text"].as_str().unwrap_or_default();
+            for v in rotated_order(variants.len(), i, round) {
+                let (name, encode) = &variants[v];
+                let cpu_start = ProcessTime::now();
+                let wall_start = Instant::now();
+                let tokens = black_box(encode(black_box(text))?);
+                let wall = wall_start.elapsed();
+                let cpu = cpu_start.elapsed();
+                writeln!(
+                    out,
+                    "{build},{threads},{round},{},{},{},{},{tokens},{name},{},{}",
+                    prompt["id"].as_str().unwrap_or_default(),
+                    prompt["bucket"].as_str().unwrap_or_default(),
+                    prompt["kind"].as_str().unwrap_or_default(),
+                    text.len(),
+                    wall.as_nanos(),
+                    cpu.as_nanos(),
+                )?;
+                rows += 1;
+            }
+        }
+    }
+    out.flush()?;
+    println!("wrote {rows} timings to {}", out_path.display());
+    Ok(())
+}
+
+/// Saturation run: `threads` workers pull prompts from one shared queue for
+/// `seconds`, like concurrent requests on the gateway's blocking pool.
+fn throughput(opts: &Opts) -> Result<()> {
+    let model = opts.path("model")?;
+    let smg = load_smg(&model)?;
+    let texts: Vec<String> = read_jsonl(&opts.path("prompts")?)?
+        .iter()
+        .map(|p| p["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let seconds: f64 = opts.get("seconds").unwrap_or("10").parse()?;
+    let threads: Vec<usize> = opts
+        .get("threads")?
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    let build = opts.get("build").unwrap_or("local");
+    let fast_threads = fastokens_threads_label();
+    let mut out = BufWriter::new(fs::File::create(opts.path("out")?)?);
+    writeln!(
+        out,
+        "build,fastokens_threads,variant,threads,seconds,prompts,tokens,cpu_seconds"
+    )?;
+    for name in opts.get("variants")?.split(',') {
+        let encode = variant_encoder(&model, &smg, name)?;
+        for &workers in &threads {
+            let run = run_throughput(&encode, &texts, workers, Duration::from_secs_f64(seconds))?;
+            let wall = run.wall.as_secs_f64();
+            println!(
+                "{name:<16} threads={workers:<3} {:>10.0} tokens/s  {:>7.1} prompts/s  cpu/wall={:.2}",
+                run.tokens as f64 / wall,
+                run.prompts as f64 / wall,
+                run.cpu.as_secs_f64() / wall,
+            );
+            writeln!(
+                out,
+                "{build},{fast_threads},{name},{workers},{wall:.3},{},{},{:.3}",
+                run.prompts,
+                run.tokens,
+                run.cpu.as_secs_f64(),
+            )?;
+        }
+    }
+    Ok(out.flush()?)
+}
+
+struct ThroughputRun {
+    prompts: usize,
+    tokens: usize,
+    wall: Duration,
+    cpu: Duration,
+}
+
+fn run_throughput(
+    encode: &TimedEncode,
+    texts: &[String],
+    workers: usize,
+    duration: Duration,
+) -> Result<ThroughputRun> {
+    let next = AtomicUsize::new(0);
+    let prompts = AtomicUsize::new(0);
+    let tokens = AtomicUsize::new(0);
+    let cpu_start = ProcessTime::now();
+    let start = Instant::now();
+    let deadline = start + duration;
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    while Instant::now() < deadline {
+                        let i = next.fetch_add(1, Ordering::Relaxed) % texts.len();
+                        tokens.fetch_add(encode(&texts[i])?, Ordering::Relaxed);
+                        prompts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("throughput worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(ThroughputRun {
+        prompts: prompts.into_inner(),
+        tokens: tokens.into_inner(),
+        wall: start.elapsed(),
+        cpu: cpu_start.elapsed(),
+    })
+}
+
+/// Median construction time per backend over `repeat` loads.
+fn load(opts: &Opts) -> Result<()> {
+    let model = opts.path("model")?;
+    let repeat: usize = opts.get("repeat").unwrap_or("5").parse()?;
+    let mut rows = vec!["variant,repeat,median_ms".to_string()];
+    for name in opts.get("variants")?.split(',') {
+        let mut times = (0..repeat)
+            .map(|_| load_variant(&model, name).map(|d| d.as_secs_f64() * 1e3))
+            .collect::<Result<Vec<f64>>>()?;
+        times.sort_by(f64::total_cmp);
+        let median = times.get(times.len() / 2).copied().unwrap_or_default();
+        println!("load {name:<16} median {median:>8.1} ms over {repeat}");
+        rows.push(format!("{name},{repeat},{median:.3}"));
+    }
+    if let Ok(out) = opts.path("out") {
+        fs::write(out, rows.join("\n") + "\n")?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Proposed backend (prototype)
 // ---------------------------------------------------------------------------
 
@@ -671,6 +934,41 @@ mod tests {
         assert_eq!(text_around(text, 4, 2), "山上有一");
         assert_eq!(text_around(text, 0, 3), "花果山");
         assert_eq!(text_around(text, 20, 3), "");
+    }
+
+    #[test]
+    fn rotated_order_starts_at_prompt_plus_round() {
+        assert_eq!(rotated_order(3, 0, 0), vec![0, 1, 2]);
+        assert_eq!(rotated_order(3, 1, 0), vec![1, 2, 0]);
+        assert_eq!(rotated_order(3, 0, 1), vec![1, 2, 0]);
+        assert_eq!(rotated_order(3, 2, 2), vec![1, 2, 0]);
+        assert_eq!(rotated_order(1, 5, 7), vec![0]);
+    }
+
+    #[test]
+    fn unknown_variant_is_rejected() {
+        let smg = create_tokenizer_from_file("mock").unwrap();
+        let err = variant_encoder(Path::new("/nonexistent"), &smg, "nope")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+        let err = load_variant(Path::new("/nonexistent"), "nope")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn smg_variant_returns_smg_token_count() {
+        let smg = create_tokenizer_from_file("mock").unwrap();
+        let encode = variant_encoder(Path::new("/nonexistent"), &smg, "smg").unwrap();
+        let expected = smg
+            .encode("Hello world test", false)
+            .unwrap()
+            .token_ids()
+            .len();
+        assert_eq!(expected, 3);
+        assert_eq!(encode("Hello world test").unwrap(), expected);
     }
 
     /// Needs a downloaded model: ENCODE_BENCH_MODEL_DIR=/path/to/model \
