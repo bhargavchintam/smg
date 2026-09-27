@@ -12,7 +12,7 @@
 //!     add_special_tokens=false (chat) and true (embeddings), then replay
 //!     growing conversations through SMG's L0/L1 caches.
 //! time    --model DIR --prompts FILE --variants a,b --rounds N --out FILE.csv
-//!         [--build LABEL]
+//!         [--build LABEL] [--round-offset K]
 //!     Wall and CPU time of every encode, variant order rotated per prompt.
 //! throughput --model DIR --prompts FILE --variants a,b --threads 1,4 --out FILE.csv
 //!         [--seconds S] [--build LABEL]
@@ -615,6 +615,9 @@ fn timing(opts: &Opts) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let prompts = read_jsonl(&opts.path("prompts")?)?;
     let rounds: usize = opts.get("rounds")?.parse()?;
+    // Separate processes (e.g. alternating builds) pass different offsets so
+    // each one rotates the variant order differently.
+    let offset: usize = opts.get("round-offset").unwrap_or("0").parse()?;
     let build = opts.get("build").unwrap_or("local");
     let threads = fastokens_threads_label();
 
@@ -631,7 +634,7 @@ fn timing(opts: &Opts) -> Result<()> {
         "build,fastokens_threads,round,prompt,bucket,kind,bytes,tokens,variant,wall_ns,cpu_ns"
     )?;
     let mut rows = 0usize;
-    for round in 0..rounds {
+    for round in offset..offset + rounds {
         for (i, prompt) in prompts.iter().enumerate() {
             let text = prompt["text"].as_str().unwrap_or_default();
             for v in rotated_order(variants.len(), i, round) {
