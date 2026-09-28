@@ -50,7 +50,8 @@ tempfile = "3.27"
 # Used only by examples/encode_backends.rs (encode-backend benchmark).
 cpu-time = "1.0"
 fastokens = { version = "=0.3.2", default-features = false }
-tikv-jemallocator.workspace = true
+# `stats` as in the gateway's default build (feature jemalloc-stats).
+tikv-jemallocator = { workspace = true, features = ["stats"] }
 
 [[bench]]
 name = "stop_sequence_search"
