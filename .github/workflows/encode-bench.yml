@@ -26,7 +26,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     env:
-      DATA: ${{ runner.temp }}/encode-bench-data
       LEGS: ${{ inputs.legs }}
       BUILDS: ${{ inputs.builds }}
       RUN_ID: ${{ matrix.runner }}-${{ github.run_id }}
@@ -35,6 +34,10 @@ jobs:
       WARMUP_SHA256: d53964f8a38c1a7beebcffb7fad973f84b2c51cb2100ffcd903ba577096d4797
       THROUGHPUT_SHA256: 3de5bd7ff4378daabe38d5af4fb9399b6d598fe4e45070eaa317688672c335f3
     steps:
+      # Set here, not in the job's env: job-level env can't use the runner context.
+      - name: Keep the benchmark data outside the checkout
+        run: echo "DATA=$RUNNER_TEMP/encode-bench-data" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@1.98.0
