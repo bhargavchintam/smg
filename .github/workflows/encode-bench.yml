@@ -67,9 +67,9 @@ jobs:
           CJK="$DATA/sources/gutenberg-23962-xiyouji.txt"
           curl -sSfL -o "$CJK" https://www.gutenberg.org/ebooks/23962.txt.utf-8
           echo "af3c9e408c0c58595b666ed9981b6fa1e9343f4bbc78309b1cb0818c32fc1f58  $CJK" | sha256sum -c -
-          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src"--cjk "$CJK" --out "$DATA/corpus"
-          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src"--cjk "$CJK" --out "$DATA/corpus-warmup" --seed 99 --per-bucket 20 --stress-slices 3
-          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src"--cjk "$CJK" --out "$DATA/corpus-throughput" --seed 7 --per-bucket 100 --stress-slices 3
+          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src" --cjk "$CJK" --out "$DATA/corpus"
+          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src" --cjk "$CJK" --out "$DATA/corpus-warmup" --seed 99 --per-bucket 20 --stress-slices 3
+          python3 build_corpus.py --repo "$GITHUB_WORKSPACE/corpus-src" --cjk "$CJK" --out "$DATA/corpus-throughput" --seed 7 --per-bucket 100 --stress-slices 3
           printf '%s  %s\n%s  %s\n%s  %s\n' \
             "$CORPUS_SHA256" "$DATA/corpus/conversations.jsonl" \
             "$WARMUP_SHA256" "$DATA/corpus-warmup/conversations.jsonl" \
