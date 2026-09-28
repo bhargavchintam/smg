@@ -42,7 +42,10 @@ mkdir -p "$DATA/sources"
 curl -sSfL -o "$DATA/sources/gutenberg-23962-xiyouji.txt" https://www.gutenberg.org/ebooks/23962.txt.utf-8
 echo "af3c9e408c0c58595b666ed9981b6fa1e9343f4bbc78309b1cb0818c32fc1f58  $DATA/sources/gutenberg-23962-xiyouji.txt" | shasum -a 256 -c -
 
-# 3. Three corpora from git-tracked SMG sources: timed, warm-up, throughput
+# 3. Three corpora from git-tracked SMG sources: timed, warm-up, throughput.
+#    CI reads those sources at upstream commit 33dd6c4e, so a branch that edits
+#    them (a fix under test) keeps the same prompts. To do the same here, pass a
+#    checkout of that commit as --repo.
 CJK="$DATA/sources/gutenberg-23962-xiyouji.txt"
 python3 build_corpus.py --repo ../../../.. --cjk "$CJK" --out "$DATA/corpus"
 python3 build_corpus.py --repo ../../../.. --cjk "$CJK" --out "$DATA/corpus-warmup" --seed 99 --per-bucket 20 --stress-slices 3
