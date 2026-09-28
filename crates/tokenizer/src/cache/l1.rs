@@ -27,6 +27,7 @@ use std::{
     },
 };
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use blake3;
 use dashmap::DashMap;
 
@@ -57,7 +58,8 @@ pub(super) enum PrefixLookup {
 /// Number of shards for concurrent access
 const NUM_SHARDS: usize = 16;
 
-/// Find ALL special token boundaries in the text
+/// Finds special token boundaries: the byte offset just past every special
+/// token occurrence.
 ///
 /// **ONLY uses special tokens** - these are atomic (special: true, normalized: false) in BPE,
 /// guaranteeing: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
@@ -70,32 +72,76 @@ const NUM_SHARDS: usize = 16;
 /// - GPT: `<|endoftext|>`
 /// - Custom: `<|reserved_special_token_N|>`
 ///
-/// Returns positions immediately after each special token (where prefixes can be cached).
-fn find_special_token_boundaries(text: &str, special_tokens: &[&str]) -> Vec<usize> {
-    if special_tokens.is_empty() {
-        return Vec::new();
-    }
+/// Build it once per tokenizer: it scans the text in a single pass however
+/// many special tokens there are. Some models declare hundreds (DeepSeek-V3.2
+/// has 798, mostly placeholders), where scanning once per token dominated
+/// the cost of an L1 lookup.
+#[derive(Debug, Clone)]
+pub(super) struct SpecialTokenMatcher {
+    /// `None` when there are no (non-empty) special tokens.
+    automaton: Option<AhoCorasick>,
+    patterns: usize,
+}
 
-    let mut boundaries = Vec::new();
-
-    // Find all special token end positions
-    for &token in special_tokens {
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(token) {
-            let boundary = start + pos + token.len();
-            // Only cache boundaries that leave some suffix to tokenize
-            if boundary < text.len() {
-                boundaries.push(boundary);
+impl SpecialTokenMatcher {
+    pub(super) fn new(special_tokens: &[&str]) -> Self {
+        // An empty token matches everywhere; it can never be a boundary.
+        let tokens: Vec<&str> = special_tokens
+            .iter()
+            .copied()
+            .filter(|token| !token.is_empty())
+            .collect();
+        let automaton = if tokens.is_empty() {
+            None
+        } else {
+            // Standard semantics allow overlapping search, which reports every
+            // occurrence of every token, as a separate scan per token would.
+            match AhoCorasick::builder()
+                .match_kind(MatchKind::Standard)
+                .build(&tokens)
+            {
+                Ok(automaton) => Some(automaton),
+                Err(error) => {
+                    // No boundaries means no L1 caching, never a wrong encoding.
+                    tracing::warn!(%error, "cannot index special tokens; L1 prefix cache disabled");
+                    None
+                }
             }
-            start = boundary;
+        };
+        Self {
+            automaton,
+            patterns: tokens.len(),
         }
     }
 
-    // Sort and deduplicate (in case multiple special tokens end at same position)
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    boundaries
+    /// Positions immediately after each special token (where prefixes can be
+    /// cached), ascending and deduplicated. The end of `text` is excluded: a
+    /// boundary must leave some suffix to tokenize.
+    ///
+    /// Matches a left-to-right scan for each token: occurrences of the same
+    /// token never overlap, occurrences of different tokens may.
+    pub(super) fn boundaries(&self, text: &str) -> Vec<usize> {
+        let Some(automaton) = &self.automaton else {
+            return Vec::new();
+        };
+        // Per token, where its next occurrence may start.
+        let mut next_start = vec![0; self.patterns];
+        let mut boundaries = Vec::new();
+        for found in automaton.find_overlapping_iter(text) {
+            let next = &mut next_start[found.pattern().as_usize()];
+            if found.start() < *next {
+                continue;
+            }
+            *next = found.end();
+            if found.end() < text.len() {
+                boundaries.push(found.end());
+            }
+        }
+        // Sort and deduplicate (in case multiple special tokens end at same position)
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
 }
 
 /// A cached prefix entry
@@ -151,10 +197,10 @@ impl L1Cache {
     /// leading BOS to distinct keys (the first segment honors this flag).
     fn boundary_seeds(
         input: &str,
-        special_tokens: &[&str],
+        special_tokens: &SpecialTokenMatcher,
         add_special_tokens: bool,
     ) -> PrefixSeeds {
-        let boundaries = find_special_token_boundaries(input, special_tokens);
+        let boundaries = special_tokens.boundaries(input);
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[add_special_tokens as u8]);
@@ -182,7 +228,8 @@ impl L1Cache {
         special_tokens: &[&str],
         add_special_tokens: bool,
     ) -> Option<(Arc<[TokenIdType]>, usize)> {
-        match self.lookup_with_seeds(input, special_tokens, add_special_tokens) {
+        let special_tokens = SpecialTokenMatcher::new(special_tokens);
+        match self.lookup_with_seeds(input, &special_tokens, add_special_tokens) {
             PrefixLookup::Hit(tokens, boundary_pos) => Some((tokens, boundary_pos)),
             PrefixLookup::Miss(_) => None,
         }
@@ -195,7 +242,7 @@ impl L1Cache {
     pub(super) fn lookup_with_seeds(
         &self,
         input: &str,
-        special_tokens: &[&str],
+        special_tokens: &SpecialTokenMatcher,
         add_special_tokens: bool,
     ) -> PrefixLookup {
         let seeds = Self::boundary_seeds(input, special_tokens, add_special_tokens);
@@ -238,7 +285,8 @@ impl L1Cache {
         special_tokens: &[&str],
         add_special_tokens: bool,
     ) -> anyhow::Result<()> {
-        let seeds = Self::boundary_seeds(input, special_tokens, add_special_tokens);
+        let special_tokens = SpecialTokenMatcher::new(special_tokens);
+        let seeds = Self::boundary_seeds(input, &special_tokens, add_special_tokens);
 
         if seeds.is_empty() {
             return Ok(());
@@ -259,7 +307,8 @@ impl L1Cache {
         special_tokens: &[&str],
         add_special_tokens: bool,
     ) -> anyhow::Result<Encoding> {
-        let seeds = Self::boundary_seeds(input, special_tokens, add_special_tokens);
+        let special_tokens = SpecialTokenMatcher::new(special_tokens);
+        let seeds = Self::boundary_seeds(input, &special_tokens, add_special_tokens);
         self.populate_with_seeds(input, &seeds, tokenizer, add_special_tokens)
     }
 
@@ -480,7 +529,74 @@ pub struct L1CacheStats {
 
 #[cfg(test)]
 mod tests {
+    use super::SpecialTokenMatcher;
     use crate::{mock::MockTokenizer, *};
+
+    /// The per-token scan L1 used before `SpecialTokenMatcher`: the reference
+    /// the one-pass matcher must agree with.
+    fn per_token_scan(text: &str, special_tokens: &[&str]) -> Vec<usize> {
+        let mut boundaries = Vec::new();
+        for &token in special_tokens {
+            let mut start = 0;
+            while let Some(pos) = text[start..].find(token) {
+                let boundary = start + pos + token.len();
+                if boundary < text.len() {
+                    boundaries.push(boundary);
+                }
+                start = boundary;
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+
+    #[test]
+    fn matcher_finds_the_same_boundaries_as_a_per_token_scan() {
+        let chatml: &[&str] = &["<|im_start|>", "<|im_end|>", "<|endoftext|>"];
+        let deepseek: &[&str] = &[
+            "<｜begin▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<｜end▁of▁sentence｜>",
+            "｜DSML｜",
+        ];
+        let nested: &[&str] = &["<s>", "<s>x", "x<s>", "s>"];
+        let self_overlapping: &[&str] = &["aa", "aaa"];
+        let duplicated: &[&str] = &["<|im_end|>", "<|im_end|>"];
+        let cases: &[(&[&str], &str)] = &[
+            (
+                chatml,
+                "<|im_start|>system\nhi<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n",
+            ),
+            // Adjacent tokens; the last one ends the text, so it is not a boundary.
+            (chatml, "<|im_end|><|im_end|><|im_start|>"),
+            (chatml, "no special tokens here"),
+            (chatml, ""),
+            (
+                deepseek,
+                "<｜begin▁of▁sentence｜>sys<｜User｜>问题<｜Assistant｜>答｜DSML｜x<｜end▁of▁sentence｜><｜User｜>",
+            ),
+            (nested, "<s>x<s>x<s>s>tail"),
+            (self_overlapping, "aaaaaaab"),
+            (duplicated, "a<|im_end|>b"),
+            (&[], "<|im_end|>tail"),
+        ];
+        for (tokens, text) in cases {
+            assert_eq!(
+                SpecialTokenMatcher::new(tokens).boundaries(text),
+                per_token_scan(text, tokens),
+                "tokens {tokens:?} on {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matcher_ignores_empty_tokens() {
+        // The per-token scan would loop forever on an empty token.
+        let matcher = SpecialTokenMatcher::new(&["", "|"]);
+        assert_eq!(matcher.boundaries("a|b"), vec![2]);
+    }
 
     #[test]
     fn test_basic_prefix_match() {

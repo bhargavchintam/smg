@@ -25,8 +25,8 @@ pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
-use l1::PrefixLookup;
 pub use l1::{L1Cache, L1CacheStats};
+use l1::{PrefixLookup, SpecialTokenMatcher};
 use rayon::prelude::*;
 
 use crate::{
@@ -72,8 +72,8 @@ pub struct CachedTokenizer {
     l1: Option<L1Cache>,
     /// Fingerprint for cache invalidation
     fingerprint: TokenizerFingerprint,
-    /// Cached special token strings (extracted once at construction)
-    special_token_strings: Vec<String>,
+    /// Special tokens, indexed once at construction for L1 boundary search
+    special_tokens: SpecialTokenMatcher,
 }
 
 impl CachedTokenizer {
@@ -93,15 +93,17 @@ impl CachedTokenizer {
             None
         };
 
-        // Extract special tokens once at construction time
+        // Extract and index special tokens once at construction time
         let special_token_strings = Self::extract_special_token_strings(&inner);
+        let tokens: Vec<&str> = special_token_strings.iter().map(String::as_str).collect();
+        let special_tokens = SpecialTokenMatcher::new(&tokens);
 
         Self {
             inner,
             l0,
             l1,
             fingerprint,
-            special_token_strings,
+            special_tokens,
         }
     }
 
@@ -180,13 +182,8 @@ impl Encoder for CachedTokenizer {
         // shared cached prefix with a fresh suffix encode; a miss tokenizes the
         // input once, seeding every boundary entry along the way.
         if let Some(l1) = &self.l1 {
-            let tokens: Vec<&str> = self
-                .special_token_strings
-                .iter()
-                .map(|s| s.as_str())
-                .collect();
-
-            let encoding = match l1.lookup_with_seeds(input, &tokens, add_special_tokens) {
+            let tokens = &self.special_tokens;
+            let encoding = match l1.lookup_with_seeds(input, tokens, add_special_tokens) {
                 PrefixLookup::Hit(prefix_tokens, prefix_len) if prefix_len < input.len() => {
                     let suffix = &input[prefix_len..];
                     // The cached prefix already carries any leading special tokens,
