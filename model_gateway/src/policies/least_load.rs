@@ -37,19 +37,27 @@ const TIE_EPSILON_SECS: f64 = 1e-6;
 /// Since-report dispatch tally for one worker: the token-work and request
 /// count of the dispatches no report has reflected yet, with each dispatch's
 /// instant, so a report that says when the engine was sampled releases
-/// exactly the dispatches it saw and keeps the later ones as credit.
+/// exactly the dispatches it saw and keeps the later ones as credit. Beside
+/// it, the picks whose request has not ended, which no report releases.
 #[derive(Clone, Debug, Default)]
 struct SincePollDispatch {
     tokens: u64,
     requests: u64,
     /// `(dispatched_at, tokens)` per dispatch, oldest first.
     dispatches: VecDeque<(Instant, u64)>,
+    /// Requests this policy picked the worker for that have not ended: raised
+    /// at the pick, lowered when the request's load guard drops, and set to
+    /// the router's live count at each load poll. The router counts a request
+    /// only once it takes that guard, after the pick; until then this is the
+    /// only record of it.
+    picked: u64,
 }
 
 impl SincePollDispatch {
     fn record(&mut self, at: Instant, tokens: u64) {
         self.tokens += tokens;
         self.requests += 1;
+        self.picked += 1;
         self.dispatches.push_back((at, tokens));
         if self.dispatches.len() > SINCE_POLL_DISPATCHES_KEPT {
             self.pop_oldest();
@@ -127,11 +135,13 @@ impl SincePollDispatch {
 ///   rather than a rate; see `live_throughput`): the fleet's nominal rate,
 ///   the mean live rate among the candidates, or `default_throughput` when
 ///   none has one;
-/// - a worker with no fresh snapshot while peers report: its live in-flight is
-///   converted to a drain-time estimate (`load · p̄ / fleet_nominal_throughput`)
-///   so it is comparable to reporting workers, not scored on a raw count;
+/// - a worker with no fresh snapshot while peers report: its in-flight count
+///   (the router's live count, or this policy's picks there whose request has
+///   not ended when those are more) is converted to a drain-time estimate
+///   (`in_flight · p̄ / fleet_nominal_throughput`) so it is comparable to
+///   reporting workers, not scored on a raw count;
 /// - the whole fleet dark (true cold start, or a backend that never reports
-///   loads): join-shortest-queue on the live in-flight count.
+///   loads): join-shortest-queue on that in-flight count.
 ///
 /// In-flight token-work is exact on the gRPC routing path (the request's token
 /// count is known at selection); the HTTP path has no token count and falls
@@ -163,13 +173,14 @@ pub struct LeastLoadPolicy {
     /// The worker monitor's load feed: the shared snapshot of every worker's
     /// latest report, read once per decision. `None` until the registry
     /// wires it; the fleet is dark until then (join-shortest-queue on the
-    /// live in-flight counts).
+    /// in-flight counts).
     loads: RwLock<Option<LoadReceiver>>,
     /// Per-worker dispatch tally (keyed by worker URL): the dispatches no
     /// report reflects yet. A decision releases the dispatches made at or
     /// before the sample instant of the worker's current report before it
     /// reads the tally. Token-work feeds the score's in-flight term; the
-    /// request count feeds the waiting-queue veto.
+    /// request count feeds the waiting-queue veto; the picks whose request
+    /// has not ended feed the in-flight count of a worker without a report.
     inflight_tokens: RwLock<HashMap<String, SincePollDispatch>>,
     /// KV-pressure weight `λ_t` (seconds).
     kv_pressure_weight: f64,
@@ -344,8 +355,9 @@ impl LeastLoadPolicy {
     /// worker missing a fresh snapshot or reporting no live rate;
     /// `fleet_has_loads` is false only when no
     /// worker reports at all, in which case we fall back to join-shortest-queue
-    /// on the live in-flight count (which, unlike the since-poll estimate,
-    /// reflects completions and so suits backends that never report loads).
+    /// on the in-flight count ([`Self::in_flight`]; unlike the since-poll
+    /// estimate it reflects completions, and so suits backends that never
+    /// report loads).
     fn score(&self, worker: &Arc<dyn Worker>, inputs: &ScoreInputs<'_>) -> f64 {
         let ScoreInputs {
             snapshot,
@@ -373,17 +385,18 @@ impl LeastLoadPolicy {
                 .seconds(inflight_tokens)
             }
             // No fresh snapshot, but peers report: score it as the best-known
-            // reporting peer plus its own live in-flight (count × mean prefill)
+            // reporting peer plus its own in-flight (count × mean prefill)
             // at the fleet's nominal throughput. Unknown load must not read as
             // idle, or every request would herd onto the one worker whose
             // report is missing; nor must it be starved.
             None if fleet_has_loads => {
                 peer_baseline
-                    + worker.load() as f64 * self.mean_prefill_tokens as f64 / nominal_throughput
+                    + Self::in_flight(worker, inflight) as f64 * self.mean_prefill_tokens as f64
+                        / nominal_throughput
             }
             // Whole fleet dark (cold start, or a backend that never reports
-            // loads): join-shortest-queue on live in-flight.
-            None => worker.load() as f64,
+            // loads): join-shortest-queue on in-flight.
+            None => Self::in_flight(worker, inflight) as f64,
         }
     }
 
@@ -394,6 +407,18 @@ impl LeastLoadPolicy {
         url: &str,
     ) -> Option<&'a WorkerLoadResponse> {
         snapshot.and_then(|snapshot| snapshot.get(url))
+    }
+
+    /// Requests in flight on a worker scored without a report: the router's
+    /// live count, or this policy's picks there whose request has not ended
+    /// when those are more. The router counts a request only once it takes
+    /// the request's load guard, after the pick, so without the picks every
+    /// decision of a burst would read the count from before the burst.
+    fn in_flight(worker: &Arc<dyn Worker>, inflight: &HashMap<String, SincePollDispatch>) -> u64 {
+        let picked = inflight
+            .get(worker.url())
+            .map_or(0, |dispatch| dispatch.picked);
+        (worker.load() as u64).max(picked)
     }
 
     /// Generation throughput is a usable drain rate only for decode and regular
@@ -685,7 +710,8 @@ impl LeastLoadPolicy {
         }
 
         // In-flight correction: credit the chosen worker with this request's
-        // token-work until its next poll refreshes the snapshot.
+        // token-work until its next poll refreshes the snapshot, and count
+        // the pick until the request ends.
         let req_tokens = credit.map_or_else(|| self.request_tokens(info), |credit| credit(best));
         inflight
             .entry(workers[best].url().to_string())
@@ -739,6 +765,37 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
             .remove(url);
     }
 
+    /// The request's load guard dropped: its pick is no longer in flight. A
+    /// request this policy did not pick (the single-worker shortcut, one in
+    /// flight across a `reset`) finds no pick left to release.
+    fn on_request_complete(&self, worker_url: &str, _success: bool) {
+        if let Some(dispatch) = self
+            .inflight_tokens
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(worker_url)
+        {
+            dispatch.picked = dispatch.picked.saturating_sub(1);
+        }
+    }
+
+    /// The load poll sets the worker's picks to the router's live count: a
+    /// pick the router dropped before taking its guard never ends and leaves
+    /// here, and a request this policy did not pick is counted from here on.
+    /// A pick racing the poll (made after it read the router's count) is
+    /// dropped as well; once its guard is taken the live count holds it, and
+    /// the next poll brings the picks back in step.
+    fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+        if let Some(dispatch) = self
+            .inflight_tokens
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(worker_url)
+        {
+            dispatch.picked = in_flight as u64;
+        }
+    }
+
     fn reset(&self) {
         self.inflight_tokens
             .write()
@@ -763,7 +820,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::{fed_pair, make_worker},
+        policies::test_support::{fed_pair, make_worker, make_workers},
         worker::{
             load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
             test_support::no_health_check,
@@ -883,8 +940,9 @@ mod tests {
 
     #[test]
     fn a_cold_fleet_of_128_spreads_a_thousand_misses() {
-        // No report anywhere: every worker scores its live in-flight count,
-        // zero for all, so the whole fleet ties on every request.
+        // No report anywhere, and each request ends before the next arrives:
+        // every worker has zero in flight, so the whole fleet ties on every
+        // request.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
         let workers: Vec<Arc<dyn Worker>> = (0..128)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
@@ -892,7 +950,9 @@ mod tests {
         let info = SelectWorkerInfo::default();
         let mut hits = vec![0usize; workers.len()];
         for _ in 0..1000 {
-            hits[policy.select_worker(&workers, &info).unwrap()] += 1;
+            let picked = policy.select_worker(&workers, &info).unwrap();
+            hits[picked] += 1;
+            policy.on_request_complete(workers[picked].url(), true);
         }
         let mean = 1000.0 / workers.len() as f64;
         assert!(
@@ -907,7 +967,71 @@ mod tests {
     }
 
     #[test]
+    fn a_dark_burst_splits_evenly_before_the_router_takes_its_guards() {
+        // Eight picks on four idle workers that never report, all made before
+        // the router takes any of their load guards: the live in-flight count
+        // still reads zero everywhere, so each pick must count the ones
+        // before it. Thirty bursts, as in the issue's reproduction.
+        for seed in 0..30 {
+            let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
+            let workers = make_workers(&[
+                "http://a:8000",
+                "http://b:8000",
+                "http://c:8000",
+                "http://d:8000",
+            ]);
+            let mut hits = [0usize; 4];
+            for _ in 0..8 {
+                hits[policy
+                    .select_worker(&workers, &SelectWorkerInfo::default())
+                    .unwrap()] += 1;
+            }
+            assert_eq!(hits, [2, 2, 2, 2], "burst {seed}");
+        }
+    }
+
+    #[test]
+    fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
+        // b holds one request. Every pick goes to a and is then dropped before
+        // its guard is taken, as the router's overload re-check does, so it
+        // never ends; the poll that follows sets a back to the router's zero.
+        let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
+        let workers = make_workers(&["http://a:8000", "http://b:8000"]);
+        workers[1].increment_load();
+        let info = SelectWorkerInfo::default();
+        for _ in 0..50 {
+            assert_eq!(policy.select_worker(&workers, &info), Some(0));
+            policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+        }
+    }
+
+    #[test]
+    fn the_load_poll_counts_the_requests_the_policy_never_picked() {
+        // After one pick each, both ended, each worker takes a request this
+        // policy did not pick (as one sent through the single-worker shortcut
+        // is). Once the poll has set each count to the router's, two picks
+        // made before their guards see each other.
+        for seed in 0..30 {
+            let policy = LeastLoadPolicy::new().with_tie_break_seed(seed);
+            let workers = make_workers(&["http://a:8000", "http://b:8000"]);
+            let info = SelectWorkerInfo::default();
+            policy.select_worker(&workers, &info);
+            policy.select_worker(&workers, &info);
+            for worker in &workers {
+                policy.on_request_complete(worker.url(), true);
+                worker.increment_load();
+                policy.reconcile_in_flight(worker.url(), worker.load());
+            }
+            let first = policy.select_worker(&workers, &info);
+            let second = policy.select_worker(&workers, &info);
+            assert_ne!(first, second, "burst {seed}");
+        }
+    }
+
+    #[test]
     fn a_strictly_cheaper_worker_wins_every_time() {
+        // Each request ends before the next arrives, so w77 stays the one
+        // worker with nothing in flight.
         let policy = LeastLoadPolicy::new().with_tie_break_seed(7);
         let workers: Vec<Arc<dyn Worker>> = (0..128)
             .map(|i| make_worker(&format!("http://w{i}:8000")))
@@ -920,6 +1044,7 @@ mod tests {
         let info = SelectWorkerInfo::default();
         for _ in 0..1000 {
             assert_eq!(policy.select_worker(&workers, &info), Some(77));
+            policy.on_request_complete(workers[77].url(), true);
         }
     }
 
